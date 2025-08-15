@@ -38,7 +38,7 @@ def upsert_position(row):
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (row["name"],row["ticker"],row["type"],row["platform"],row["quantity"],row["avg_cost"],
          row.get("currency","EUR"),row.get("isin"),row.get("ter"),row.get("purchase_date"),
-        row.get("price_source","manual"),row.get("price_symbol"),row.get("notes")))
+         row.get("price_source","manual"),row.get("price_symbol"),row.get("notes")))
     conn.commit(); conn.close()
 
 def update_position_pricesettings(position_id: int, price_source: str, price_symbol: str):
@@ -71,39 +71,51 @@ def latest_prices():
 
 # ---------------- Price providers ----------------
 def fetch_yahoo(symbol: str):
-    """Robuster Yahoo-Fetch: fast_info -> history() Fallback"""
+    """Yahoo robust: fast_info -> history() -> download() + Diagnose"""
     try:
         t = yf.Ticker(symbol)
+        px, cc, reason = None, None, ""
 
-        px, cc = None, None
-        # 1) fast_info
+        # 1) fast_info (schnell)
         try:
             fi = t.fast_info
             if fi:
                 px = fi.get("last_price") or fi.get("last_close") or fi.get("lastPrice")
                 cc = fi.get("currency")
-        except Exception:
-            pass
+        except Exception as e:
+            reason += f"[fast_info:{type(e).__name__}] "
 
-        # 2) Fallback: letzter Close aus History
+        # 2) Fallback: History
         if px is None:
-            hist = t.history(period="5d", interval="1d", auto_adjust=False)
-            if not hist.empty:
-                px = float(hist["Close"].dropna().iloc[-1])
+            try:
+                hist = t.history(period="10d", interval="1d", auto_adjust=False)
+                if not hist.empty:
+                    px = float(hist["Close"].dropna().iloc[-1])
+            except Exception as e:
+                reason += f"[history:{type(e).__name__}] "
 
-        # 3) Währung best effort
+        # 3) Zweiter Fallback: download()
+        if px is None:
+            try:
+                dl = yf.download(symbol, period="1d", interval="1d", progress=False)
+                if not dl.empty:
+                    px = float(dl["Close"].dropna().iloc[-1])
+            except Exception as e:
+                reason += f"[download:{type(e).__name__}] "
+
+        # 4) Währung best effort
         if cc is None:
             try:
                 info = getattr(t, "info", {}) or {}
                 cc = info.get("currency")
             except Exception:
-                cc = None
+                pass
 
-        if px is None:
-            return None
-        return float(px), (cc or "EUR"), "yahoo"
-    except Exception:
-        return None
+        if px is not None:
+            return {"ok": True, "price": float(px), "ccy": (cc or "EUR"), "provider": "yahoo"}
+        return {"ok": False, "reason": (reason or "no data")}
+    except Exception as e:
+        return {"ok": False, "reason": f"exception:{type(e).__name__}"}
 
 def fetch_coingecko(coin_id: str, vs="eur"):
     try:
@@ -121,18 +133,30 @@ def update_prices(selected_ids=None):
     df = fetch_positions()
     if selected_ids:
         df = df[df["id"].isin(selected_ids)]
-    out = []
+    rows = []
     for _, r in df.iterrows():
         src = (r.get("price_source") or "manual").lower()
         sym = r.get("price_symbol") or r.get("ticker") or r.get("name")
-        res = fetch_yahoo(sym) if src=="yahoo" else fetch_coingecko(sym) if src=="coingecko" else None
-        if res:
-            px, cur, provider = res
-            add_price_snapshot(r["ticker"] or r["name"], px, cur, provider)
-            out.append((r["name"], px, provider))
+
+        if src == "yahoo":
+            res = fetch_yahoo(sym)
+            if res.get("ok"):
+                add_price_snapshot(r["ticker"] or r["name"], res["price"], res["ccy"], "yahoo")
+                rows.append((r["name"], res["price"], "yahoo"))
+            else:
+                rows.append((r["name"], None, f"kein Feed ({res.get('reason')})"))
+        elif src == "coingecko":
+            r2 = fetch_coingecko(sym)
+            if r2:
+                px, cur, provider = r2
+                add_price_snapshot(r["ticker"] or r["name"], px, cur, provider)
+                rows.append((r["name"], px, provider))
+            else:
+                rows.append((r["name"], None, "kein Feed (coingecko)"))
         else:
-            out.append((r["name"], None, "kein Feed"))
-    return pd.DataFrame(out, columns=["Asset","Preis","Quelle/Status"])
+            rows.append((r["name"], None, "kein Feed (manual)"))
+
+    return pd.DataFrame(rows, columns=["Asset","Preis","Quelle/Status"])
 
 # ---------------- UI ----------------
 init_db()
