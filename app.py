@@ -38,7 +38,13 @@ def upsert_position(row):
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (row["name"],row["ticker"],row["type"],row["platform"],row["quantity"],row["avg_cost"],
          row.get("currency","EUR"),row.get("isin"),row.get("ter"),row.get("purchase_date"),
-         row.get("price_source","manual"),row.get("price_symbol"),row.get("notes")))
+        row.get("price_source","manual"),row.get("price_symbol"),row.get("notes")))
+    conn.commit(); conn.close()
+
+def update_position_pricesettings(position_id: int, price_source: str, price_symbol: str):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("UPDATE positions SET price_source=?, price_symbol=? WHERE id=?;",
+                (price_source, price_symbol, position_id))
     conn.commit(); conn.close()
 
 def fetch_positions():
@@ -60,17 +66,17 @@ def latest_prices():
       FROM prices p1 JOIN (SELECT ticker, MAX(asof) a FROM prices GROUP BY ticker) p2
       ON p1.ticker=p2.ticker AND p1.asof=p2.a;
     """, conn)
-    conn.close(); 
+    conn.close()
     return df
 
 # ---------------- Price providers ----------------
 def fetch_yahoo(symbol: str):
+    """Robuster Yahoo-Fetch: fast_info -> history() Fallback"""
     try:
         t = yf.Ticker(symbol)
 
-        # 1) Schnellweg über fast_info
-        px = None
-        cc = None
+        px, cc = None, None
+        # 1) fast_info
         try:
             fi = t.fast_info
             if fi:
@@ -79,16 +85,16 @@ def fetch_yahoo(symbol: str):
         except Exception:
             pass
 
-        # 2) Fallback über Kurs-Historie (nimmt den letzten validen Close)
+        # 2) Fallback: letzter Close aus History
         if px is None:
             hist = t.history(period="5d", interval="1d", auto_adjust=False)
             if not hist.empty:
                 px = float(hist["Close"].dropna().iloc[-1])
 
-        # 3) Währung notfalls aus Info holen (best effort)
+        # 3) Währung best effort
         if cc is None:
             try:
-                info = t.get_info() if hasattr(t, "get_info") else getattr(t, "info", {}) or {}
+                info = getattr(t, "info", {}) or {}
                 cc = info.get("currency")
             except Exception:
                 cc = None
@@ -99,13 +105,42 @@ def fetch_yahoo(symbol: str):
     except Exception:
         return None
 
+def fetch_coingecko(coin_id: str, vs="eur"):
+    try:
+        r = requests.get(
+            f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={vs}",
+            timeout=15
+        )
+        r.raise_for_status()
+        px = float(r.json()[coin_id][vs])
+        return px, vs.upper(), "coingecko"
+    except Exception:
+        return None
+
+def update_prices(selected_ids=None):
+    df = fetch_positions()
+    if selected_ids:
+        df = df[df["id"].isin(selected_ids)]
+    out = []
+    for _, r in df.iterrows():
+        src = (r.get("price_source") or "manual").lower()
+        sym = r.get("price_symbol") or r.get("ticker") or r.get("name")
+        res = fetch_yahoo(sym) if src=="yahoo" else fetch_coingecko(sym) if src=="coingecko" else None
+        if res:
+            px, cur, provider = res
+            add_price_snapshot(r["ticker"] or r["name"], px, cur, provider)
+            out.append((r["name"], px, provider))
+        else:
+            out.append((r["name"], None, "kein Feed"))
+    return pd.DataFrame(out, columns=["Asset","Preis","Quelle/Status"])
+
 # ---------------- UI ----------------
 init_db()
 st.title("Portfolio Manager")
 
 tabs = st.tabs(["Übersicht (Overview)","Neue Position (New)","Preise (Prices)","Details (Details)"])
 
-# --- Übersicht (robust, kein KeyError mehr) ---
+# --- Übersicht ---
 with tabs[0]:
     st.subheader("Übersicht (Overview)")
     pos = fetch_positions()
@@ -121,11 +156,9 @@ with tabs[0]:
         join_key = pos["ticker"].where(pos["ticker"].notna(), pos["name"])
         merged = pos.merge(lp, left_on=join_key, right_on="_t", how="left")
 
-    # numerisch casten
     for col in ["quantity", "avg_cost", "price"]:
         merged[col] = pd.to_numeric(merged.get(col), errors="coerce")
 
-    # Kennzahlen
     merged["Marktwert €"] = (merged["quantity"].fillna(0) * merged["price"].fillna(0)).round(2)
     merged["Gewinn/Verlust €"] = (
         merged["Marktwert €"] - (merged["quantity"].fillna(0) * merged["avg_cost"].fillna(0))
@@ -181,15 +214,32 @@ with tabs[1]:
         })
         st.success("Gespeichert.")
 
-# --- Preise ---
+# --- Preise (mit Bearbeiten) ---
 with tabs[2]:
     st.subheader("Kurse aktualisieren (Update Prices)")
     dfp = fetch_positions()
-    ids = st.multiselect("Positionen (optional)", dfp["id"].tolist(),
-                         format_func=lambda i: dfp[dfp["id"]==i]["name"].iloc[0] if not dfp.empty else i)
-    if st.button("Preise abrufen (Fetch)"):
-        res = update_prices(ids if ids else None)
-        st.dataframe(res, use_container_width=True)
+    if dfp.empty:
+        st.info("Keine Positionen vorhanden.")
+    else:
+        st.write("Quelle & Symbol bearbeiten, dann speichern und Preise abrufen.")
+        for _, r in dfp.iterrows():
+            c1, c2, c3, c4 = st.columns([3,2,3,2])
+            c1.write(r["name"])
+            src_val = (r.get("price_source") or "manual")
+            src = c2.selectbox("Quelle", ["manual","yahoo","coingecko"],
+                               index=["manual","yahoo","coingecko"].index(src_val),
+                               key=f"src_{r['id']}")
+            sym = c3.text_input("Symbol", value=(r.get("price_symbol") or r.get("ticker") or ""),
+                                key=f"sym_{r['id']}")
+            if c4.button("Speichern", key=f"save_{r['id']}"):
+                update_position_pricesettings(int(r["id"]), src, sym)
+                st.success(f"Gespeichert: {r['name']}")
+        st.divider()
+        ids = st.multiselect("Positionen (optional)", dfp["id"].tolist(),
+                             format_func=lambda i: dfp[dfp["id"]==i]["name"].iloc[0])
+        if st.button("Preise abrufen (Fetch)"):
+            res = update_prices(ids if ids else None)
+            st.dataframe(res, use_container_width=True)
 
 # --- Details ---
 with tabs[3]:
@@ -210,3 +260,8 @@ with tabs[3]:
             st.line_chart(ph.set_index("asof")["price"])
         else:
             st.caption("Noch keine Preisdaten gespeichert.")
+        with st.expander("Heutigen Kurs manuell speichern (Add today's price)"):
+            p = st.number_input("Preis € (Price €)", min_value=0.0, step=0.01, format="%.2f", key=f"man_{row['id']}")
+            if st.button("Speichern (Save)", key=f"manbtn_{row['id']}"):
+                add_price_snapshot(row["ticker"] or row["name"], p, row.get("currency","EUR"), "manual")
+                st.success("Gespeichert – Übersicht aktualisieren.")
