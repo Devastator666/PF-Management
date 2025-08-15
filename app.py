@@ -6,7 +6,7 @@ from datetime import date
 DB_PATH = "portfolio.db"
 st.set_page_config(page_title="Portfolio Manager", layout="wide")
 
-# ---- DB ----
+# ---------------- DB ----------------
 def get_conn():
     c = sqlite3.connect(DB_PATH)
     c.execute("PRAGMA foreign_keys = ON;")
@@ -60,9 +60,10 @@ def latest_prices():
       FROM prices p1 JOIN (SELECT ticker, MAX(asof) a FROM prices GROUP BY ticker) p2
       ON p1.ticker=p2.ticker AND p1.asof=p2.a;
     """, conn)
-    conn.close(); return df
+    conn.close(); 
+    return df
 
-# ---- Price providers ----
+# ---------------- Price providers ----------------
 def fetch_yahoo(symbol):
     try:
         t = yf.Ticker(symbol); info = t.fast_info
@@ -95,11 +96,64 @@ def update_prices(selected_ids=None):
             out.append((r["name"], None, "kein Feed"))
     return pd.DataFrame(out, columns=["Asset","Preis","Quelle/Status"])
 
-# ---- UI ----
+# ---------------- UI ----------------
 init_db()
 st.title("Portfolio Manager")
+
 tabs = st.tabs(["Übersicht (Overview)","Neue Position (New)","Preise (Prices)","Details (Details)"])
 
+# --- Übersicht (robust, kein KeyError mehr) ---
+with tabs[0]:
+    st.subheader("Übersicht (Overview)")
+    pos = fetch_positions()
+
+    lp = latest_prices()
+    if lp.empty:
+        merged = pos.copy()
+        for col in ["price", "currency", "asof"]:
+            if col not in merged.columns:
+                merged[col] = pd.NA
+    else:
+        lp = lp.rename(columns={"ticker": "_t"})
+        join_key = pos["ticker"].where(pos["ticker"].notna(), pos["name"])
+        merged = pos.merge(lp, left_on=join_key, right_on="_t", how="left")
+
+    # numerisch casten
+    for col in ["quantity", "avg_cost", "price"]:
+        merged[col] = pd.to_numeric(merged.get(col), errors="coerce")
+
+    # Kennzahlen
+    merged["Marktwert €"] = (merged["quantity"].fillna(0) * merged["price"].fillna(0)).round(2)
+    merged["Gewinn/Verlust €"] = (
+        merged["Marktwert €"] - (merged["quantity"].fillna(0) * merged["avg_cost"].fillna(0))
+    ).round(2)
+    with pd.option_context("mode.use_inf_as_na", True):
+        merged["Gewinn %"] = ((merged["price"] - merged["avg_cost"]) / merged["avg_cost"]).astype(float)
+        merged["Gewinn %"] = merged["Gewinn %"].fillna(0).round(4)
+
+    rename_map = {
+        "name": "Asset/Name",
+        "ticker": "Ticker/Symbol",
+        "type": "Positionsart",
+        "platform": "Plattform/Wallet/Broker",
+        "quantity": "Stück",
+        "avg_cost": "Ø-Kaufkurs €",
+        "price": "Preis € (auto)",
+        "Marktwert €": "Marktwert €",
+        "Gewinn/Verlust €": "Gewinn/Verlust €",
+        "Gewinn %": "Gewinn %",
+        "purchase_date": "Kaufdatum",
+        "ter": "TER % p.a.",
+        "currency": "Währung",
+        "isin": "ISIN/Contract",
+        "notes": "Notizen",
+    }
+    cols = [c for c in rename_map.keys() if c in merged.columns]
+    disp = merged[cols].rename(columns=rename_map)
+    disp = disp.sort_values("Marktwert €", ascending=False, na_position="last")
+    st.dataframe(disp, use_container_width=True)
+
+# --- Neue Position ---
 with tabs[1]:
     st.subheader("Neue Position erfassen (Add New Position)")
     col1,col2,col3 = st.columns(3)
@@ -124,6 +178,7 @@ with tabs[1]:
         })
         st.success("Gespeichert.")
 
+# --- Preise ---
 with tabs[2]:
     st.subheader("Kurse aktualisieren (Update Prices)")
     dfp = fetch_positions()
@@ -133,18 +188,7 @@ with tabs[2]:
         res = update_prices(ids if ids else None)
         st.dataframe(res, use_container_width=True)
 
-with tabs[0]:
-    st.subheader("Übersicht (Overview)")
-    pos = fetch_positions()
-    lp = latest_prices().rename(columns={"ticker":"_t"})
-    merged = pos.merge(lp, left_on=pos["ticker"].fillna(pos["name"]), right_on="_t", how="left")
-    merged["Marktwert €"] = (merged["quantity"].astype(float) * merged["price"].astype(float)).round(2)
-    merged["Gewinn/Verlust €"] = (merged["Marktwert €"] - (merged["quantity"]*merged["avg_cost"])).round(2)
-    merged["Gewinn %"] = ((merged["price"]-merged["avg_cost"])/merged["avg_cost"]).round(4)
-    disp = merged[["name","ticker","type","platform","quantity","avg_cost","price","Marktwert €","Gewinn/Verlust €","Gewinn %","purchase_date","ter","currency","isin","notes"]]
-    disp.columns = ["Asset/Name","Ticker/Symbol","Positionsart","Plattform/Wallet/Broker","Stück","Ø-Kaufkurs €","Preis € (auto)","Marktwert €","Gewinn/Verlust €","Gewinn %","Kaufdatum","TER % p.a.","Währung","ISIN/Contract","Notizen"]
-    st.dataframe(disp.sort_values("Marktwert €", ascending=False, na_position="last"), use_container_width=True)
-
+# --- Details ---
 with tabs[3]:
     st.subheader("Details (Details)")
     pos = fetch_positions()
