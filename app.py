@@ -64,37 +64,40 @@ def latest_prices():
     return df
 
 # ---------------- Price providers ----------------
-def fetch_yahoo(symbol):
+def fetch_yahoo(symbol: str):
     try:
-        t = yf.Ticker(symbol); info = t.fast_info
-        return float(info.get("last_price")), info.get("currency","EUR"), "yahoo"
+        t = yf.Ticker(symbol)
+
+        # 1) Schnellweg über fast_info
+        px = None
+        cc = None
+        try:
+            fi = t.fast_info
+            if fi:
+                px = fi.get("last_price") or fi.get("last_close") or fi.get("lastPrice")
+                cc = fi.get("currency")
+        except Exception:
+            pass
+
+        # 2) Fallback über Kurs-Historie (nimmt den letzten validen Close)
+        if px is None:
+            hist = t.history(period="5d", interval="1d", auto_adjust=False)
+            if not hist.empty:
+                px = float(hist["Close"].dropna().iloc[-1])
+
+        # 3) Währung notfalls aus Info holen (best effort)
+        if cc is None:
+            try:
+                info = t.get_info() if hasattr(t, "get_info") else getattr(t, "info", {}) or {}
+                cc = info.get("currency")
+            except Exception:
+                cc = None
+
+        if px is None:
+            return None
+        return float(px), (cc or "EUR"), "yahoo"
     except Exception:
         return None
-
-def fetch_coingecko(coin_id, vs="eur"):
-    try:
-        r = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={vs}", timeout=15)
-        r.raise_for_status()
-        px = float(r.json()[coin_id][vs])
-        return px, vs.upper(), "coingecko"
-    except Exception:
-        return None
-
-def update_prices(selected_ids=None):
-    df = fetch_positions()
-    if selected_ids: df = df[df["id"].isin(selected_ids)]
-    out = []
-    for _, r in df.iterrows():
-        src = (r.get("price_source") or "manual").lower()
-        sym = r.get("price_symbol") or r.get("ticker") or r.get("name")
-        res = fetch_yahoo(sym) if src=="yahoo" else fetch_coingecko(sym) if src=="coingecko" else None
-        if res:
-            px, cur, provider = res
-            add_price_snapshot(r["ticker"] or r["name"], px, cur, provider)
-            out.append((r["name"], px, provider))
-        else:
-            out.append((r["name"], None, "kein Feed"))
-    return pd.DataFrame(out, columns=["Asset","Preis","Quelle/Status"])
 
 # ---------------- UI ----------------
 init_db()
