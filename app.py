@@ -32,13 +32,30 @@ def init_db():
     conn.commit(); conn.close()
 
 def upsert_position(row):
+    # Duplicate-Schutz: gleicher Name + Plattform wird nicht doppelt angelegt
     conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id FROM positions WHERE name=? AND ifnull(platform,'')=ifnull(?, '')",
+                (row["name"], row.get("platform")))
+    exists = cur.fetchone()
+    if exists:
+        conn.close()
+        return
     cur.execute("""INSERT INTO positions
         (name,ticker,type,platform,quantity,avg_cost,currency,isin,ter,purchase_date,price_source,price_symbol,notes)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (row["name"],row["ticker"],row["type"],row["platform"],row["quantity"],row["avg_cost"],
          row.get("currency","EUR"),row.get("isin"),row.get("ter"),row.get("purchase_date"),
          row.get("price_source","manual"),row.get("price_symbol"),row.get("notes")))
+    conn.commit(); conn.close()
+
+def delete_position_and_prices(position_id: int):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT ticker, name FROM positions WHERE id=?", (position_id,))
+    r = cur.fetchone()
+    if r:
+        tick_or_name = r[0] or r[1]
+        cur.execute("DELETE FROM prices WHERE ticker=?", (tick_or_name,))
+        cur.execute("DELETE FROM positions WHERE id=?", (position_id,))
     conn.commit(); conn.close()
 
 def update_position_pricesettings(position_id: int, price_source: str, price_symbol: str):
@@ -69,41 +86,84 @@ def latest_prices():
     conn.close()
     return df
 
+# ---------------- Helpers ----------------
+def fetch_fx(base: str, quote: str):
+    """EUR/FX via exchangerate.host (kostenlos, kein Key)."""
+    if not base or not quote or base.upper() == quote.upper():
+        return 1.0
+    try:
+        r = requests.get(
+            "https://api.exchangerate.host/latest",
+            params={"base": base.upper(), "symbols": quote.upper()},
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        r.raise_for_status()
+        data = r.json()
+        rate = float(data["rates"][quote.upper()])
+        return rate
+    except Exception:
+        return None
+
 # ---------------- Price providers ----------------
-def fetch_yahoo(symbol: str):
-    """Yahoo robust: fast_info -> history() -> download() + Diagnose"""
+def fetch_yahoo_quote_api(symbol: str):
+    """Direkte Yahoo-Quote-API (JSON). Liefert regulären Marktpreis & Währung."""
+    try:
+        url = "https://query1.finance.yahoo.com/v7/finance/quote"
+        r = requests.get(url, params={"symbols": symbol}, timeout=15,
+                         headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        js = r.json()
+        res = js.get("quoteResponse", {}).get("result", [])
+        if not res:
+            return {"ok": False, "reason": "quote empty"}
+        item = res[0]
+        px = item.get("regularMarketPrice")
+        ccy = item.get("currency")
+        if px is None:
+            return {"ok": False, "reason": "no regularMarketPrice"}
+        return {"ok": True, "price": float(px), "ccy": ccy or "EUR", "provider": "yahoo-api"}
+    except Exception as e:
+        return {"ok": False, "reason": f"api:{type(e).__name__}"}
+
+def fetch_yahoo_yfinance(symbol: str):
+    """yfinance Fallback: fast_info -> history -> download, mit Diagnosen."""
     try:
         t = yf.Ticker(symbol)
-        px, cc, reason = None, None, ""
+        px, cc, notes = None, None, []
 
-        # 1) fast_info (schnell)
+        # fast_info
         try:
             fi = t.fast_info
             if fi:
                 px = fi.get("last_price") or fi.get("last_close") or fi.get("lastPrice")
                 cc = fi.get("currency")
         except Exception as e:
-            reason += f"[fast_info:{type(e).__name__}] "
+            notes.append(f"fast_info:{type(e).__name__}")
 
-        # 2) Fallback: History
+        # history
         if px is None:
             try:
                 hist = t.history(period="10d", interval="1d", auto_adjust=False)
                 if not hist.empty:
                     px = float(hist["Close"].dropna().iloc[-1])
+                else:
+                    notes.append("history:empty")
             except Exception as e:
-                reason += f"[history:{type(e).__name__}] "
+                notes.append(f"history:{type(e).__name__}")
 
-        # 3) Zweiter Fallback: download()
+        # download
         if px is None:
             try:
                 dl = yf.download(symbol, period="1d", interval="1d", progress=False)
                 if not dl.empty:
                     px = float(dl["Close"].dropna().iloc[-1])
+                else:
+                    notes.append("download:empty")
             except Exception as e:
-                reason += f"[download:{type(e).__name__}] "
+                notes.append(f"download:{type(e).__name__}")
 
-        # 4) Währung best effort
+        # currency
         if cc is None:
             try:
                 info = getattr(t, "info", {}) or {}
@@ -112,15 +172,24 @@ def fetch_yahoo(symbol: str):
                 pass
 
         if px is not None:
-            return {"ok": True, "price": float(px), "ccy": (cc or "EUR"), "provider": "yahoo"}
-        return {"ok": False, "reason": (reason or "no data")}
+            return {"ok": True, "price": float(px), "ccy": (cc or "EUR"), "provider": "yfinance"}
+        return {"ok": False, "reason": " | ".join(notes) or "no data"}
     except Exception as e:
-        return {"ok": False, "reason": f"exception:{type(e).__name__}"}
+        return {"ok": False, "reason": f"yf:{type(e).__name__}"}
+
+def fetch_yahoo(symbol: str):
+    """Kombinierter Yahoo-Fetch: erst Quote-API, dann yfinance."""
+    res = fetch_yahoo_quote_api(symbol)
+    if res.get("ok"):
+        return res
+    res2 = fetch_yahoo_yfinance(symbol)
+    return res2 if res2.get("ok") else {"ok": False, "reason": f"{res.get('reason')} -> {res2.get('reason')}"}
 
 def fetch_coingecko(coin_id: str, vs="eur"):
     try:
         r = requests.get(
-            f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies={vs}",
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": coin_id, "vs_currencies": vs},
             timeout=15
         )
         r.raise_for_status()
@@ -137,22 +206,31 @@ def update_prices(selected_ids=None):
     for _, r in df.iterrows():
         src = (r.get("price_source") or "manual").lower()
         sym = r.get("price_symbol") or r.get("ticker") or r.get("name")
+        target_ccy = (r.get("currency") or "EUR").upper()
 
         if src == "yahoo":
             res = fetch_yahoo(sym)
             if res.get("ok"):
-                add_price_snapshot(r["ticker"] or r["name"], res["price"], res["ccy"], "yahoo")
-                rows.append((r["name"], res["price"], "yahoo"))
+                px, ccy, provider = res["price"], res["ccy"].upper(), res["provider"]
+                if ccy != target_ccy:
+                    rate = fetch_fx(ccy, target_ccy)  # ccy -> target_ccy
+                    if rate:
+                        px = round(px * rate, 6)
+                        provider = f"{provider}+fx"
+                add_price_snapshot(r["ticker"] or r["name"], px, target_ccy, provider)
+                rows.append((r["name"], px, provider))
             else:
                 rows.append((r["name"], None, f"kein Feed ({res.get('reason')})"))
+
         elif src == "coingecko":
-            r2 = fetch_coingecko(sym)
+            r2 = fetch_coingecko(sym, vs=target_ccy.lower())
             if r2:
                 px, cur, provider = r2
                 add_price_snapshot(r["ticker"] or r["name"], px, cur, provider)
                 rows.append((r["name"], px, provider))
             else:
                 rows.append((r["name"], None, "kein Feed (coingecko)"))
+
         else:
             rows.append((r["name"], None, "kein Feed (manual)"))
 
@@ -192,21 +270,12 @@ with tabs[0]:
         merged["Gewinn %"] = merged["Gewinn %"].fillna(0).round(4)
 
     rename_map = {
-        "name": "Asset/Name",
-        "ticker": "Ticker/Symbol",
-        "type": "Positionsart",
-        "platform": "Plattform/Wallet/Broker",
-        "quantity": "Stück",
-        "avg_cost": "Ø-Kaufkurs €",
-        "price": "Preis € (auto)",
-        "Marktwert €": "Marktwert €",
-        "Gewinn/Verlust €": "Gewinn/Verlust €",
-        "Gewinn %": "Gewinn %",
-        "purchase_date": "Kaufdatum",
-        "ter": "TER % p.a.",
-        "currency": "Währung",
-        "isin": "ISIN/Contract",
-        "notes": "Notizen",
+        "name": "Asset/Name", "ticker": "Ticker/Symbol", "type": "Positionsart",
+        "platform": "Plattform/Wallet/Broker", "quantity": "Stück", "avg_cost": "Ø-Kaufkurs €",
+        "price": "Preis € (auto)", "Marktwert €": "Marktwert €",
+        "Gewinn/Verlust €": "Gewinn/Verlust €", "Gewinn %": "Gewinn %",
+        "purchase_date": "Kaufdatum", "ter": "TER % p.a.", "currency": "Währung",
+        "isin": "ISIN/Contract", "notes": "Notizen",
     }
     cols = [c for c in rename_map.keys() if c in merged.columns]
     disp = merged[cols].rename(columns=rename_map)
@@ -275,6 +344,7 @@ with tabs[3]:
         sel = st.selectbox("Asset wählen", pos["name"].tolist())
         row = pos[pos["name"]==sel].iloc[0]
         st.write(row.to_dict())
+        # Preis-Historie
         conn = get_conn()
         ph = pd.read_sql_query("SELECT asof, price FROM prices WHERE ticker=? ORDER BY asof",
                                conn, params=((row['ticker'] or row['name']),))
@@ -284,8 +354,14 @@ with tabs[3]:
             st.line_chart(ph.set_index("asof")["price"])
         else:
             st.caption("Noch keine Preisdaten gespeichert.")
+        # Manuell speichern
         with st.expander("Heutigen Kurs manuell speichern (Add today's price)"):
             p = st.number_input("Preis € (Price €)", min_value=0.0, step=0.01, format="%.2f", key=f"man_{row['id']}")
             if st.button("Speichern (Save)", key=f"manbtn_{row['id']}"):
                 add_price_snapshot(row["ticker"] or row["name"], p, row.get("currency","EUR"), "manual")
                 st.success("Gespeichert – Übersicht aktualisieren.")
+        # Löschen
+        with st.expander("Position löschen (Delete position)"):
+            if st.button("Position endgültig löschen"):
+                delete_position_and_prices(int(row["id"]))
+                st.success("Position gelöscht. Seite neu laden.")
